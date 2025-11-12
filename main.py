@@ -1,8 +1,13 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from typing import List, Optional
+from datetime import datetime
+from database import db, create_document, get_documents
+from schemas import User, BlogPost, ContactMessage
 
-app = FastAPI()
+app = FastAPI(title="SaaS Starter API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,15 +19,109 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "SaaS API running"}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+# --- Auth (simple email link demo placeholders; storing users) ---
+class RegisterPayload(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
 
+@app.post("/api/auth/register")
+def register_user(payload: RegisterPayload):
+    # very basic: store hashed password string placeholder (no real hashing here)
+    # In production use passlib/bcrypt. Keeping dependencies minimal per template.
+    existing = get_documents("user", {"email": payload.email.lower()}, limit=1)
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = User(name=payload.name, email=payload.email.lower(), password_hash=f"sha256:{payload.password}")
+    user_id = create_document("user", user)
+    return {"id": user_id, "name": user.name, "email": user.email}
+
+class LoginPayload(BaseModel):
+    email: EmailStr
+    password: str
+
+@app.post("/api/auth/login")
+def login_user(payload: LoginPayload):
+    user_docs = get_documents("user", {"email": payload.email.lower()}, limit=1)
+    if not user_docs:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    user = user_docs[0]
+    if user.get("password_hash") != f"sha256:{payload.password}":
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    # return a fake token for demo purposes
+    return {"token": "demo-token", "user": {"name": user.get("name"), "email": user.get("email")}}
+
+# --- Pricing (static) ---
+@app.get("/api/pricing")
+def get_pricing():
+    return {
+        "currency": "USD",
+        "plans": [
+            {"name": "Starter", "price": 0, "period": "mo", "features": ["Up to 3 projects", "Community support", "Basic analytics"]},
+            {"name": "Pro", "price": 19, "period": "mo", "features": ["Unlimited projects", "Priority support", "Advanced analytics"]},
+            {"name": "Business", "price": 49, "period": "mo", "features": ["Team workspaces", "SSO (SAML)", "Custom reports"]}
+        ]
+    }
+
+# --- Blog ---
+@app.get("/api/blog", response_model=List[dict])
+def list_posts():
+    posts = get_documents("blogpost", {"status": "published"})
+    # map to light-weight
+    mapped = []
+    for p in posts:
+        mapped.append({
+            "id": str(p.get("_id")),
+            "title": p.get("title"),
+            "slug": p.get("slug"),
+            "excerpt": p.get("excerpt"),
+            "author_name": p.get("author_name"),
+            "cover_image": p.get("cover_image"),
+            "tags": p.get("tags", []),
+            "published_at": p.get("published_at")
+        })
+    return mapped
+
+class BlogCreatePayload(BaseModel):
+    title: str
+    content: str
+    author_name: str
+    tags: Optional[List[str]] = None
+
+@app.post("/api/blog")
+def create_post(payload: BlogCreatePayload):
+    slug = payload.title.lower().strip().replace(" ", "-")
+    post = BlogPost(
+        title=payload.title,
+        slug=slug,
+        excerpt=(payload.content[:140] + "...") if len(payload.content) > 140 else payload.content,
+        content=payload.content,
+        author_name=payload.author_name,
+        tags=payload.tags or [],
+        status="published",
+        published_at=datetime.utcnow()
+    )
+    post_id = create_document("blogpost", post)
+    return {"id": post_id, "slug": slug}
+
+# --- Contact ---
+class ContactPayload(BaseModel):
+    name: str
+    email: EmailStr
+    company: Optional[str] = None
+    message: str
+
+@app.post("/api/contact")
+def submit_contact(payload: ContactPayload):
+    entry = ContactMessage(name=payload.name, email=payload.email, company=payload.company, message=payload.message)
+    contact_id = create_document("contactmessage", entry)
+    return {"id": contact_id, "status": "received"}
+
+# --- Health/test ---
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
@@ -31,39 +130,23 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
+            response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
+            response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
     return response
-
 
 if __name__ == "__main__":
     import uvicorn
